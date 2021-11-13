@@ -1,0 +1,251 @@
+##Loading required packages 
+library(dada2)
+library(ape)
+library(DECIPHER)
+library(phangorn)
+library(ggplot2)
+library(phyloseq)
+library("plyr")
+library("Rcpp")
+library('Matrix')
+library(seqinr)
+library(dplyr)
+library(biomformat)
+
+#Had to split pipeline into 3 sections, each dataset had its own filter / trim parameters, and different methods for chimera removal. Push each set mostly
+#through dada, combine the 3 seqtab.nochim tables at the end and assign taxonomy to all three 
+
+setwd("~/bodke/celiacWithNewControl/")
+path <- "~/bodke/celiacWithNewControl/" # CHANGE ME to the directory containing the fastq files after unzipping.
+list.files(path)
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="Amplicon-seq_of_gut_microbiota_Homo_Sapiens_1.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="Amplicon-seq_of_gut_microbiota_Homo_Sapiens_2.fastq.gz", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+plotQualityProfile(fnFs[1:2])
+plotQualityProfile(fnRs[1:2])
+
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,truncLen=c(240,160),
+                      maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                      compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+head(out)
+errF <- learnErrors(filtFs, multithread=FALSE, randomize = TRUE)
+errR <- learnErrors(filtRs, multithread=FALSE, randomize = TRUE)
+dadaFs <- dada(filtFs, err=errF, multithread=FALSE)
+dadaRs <- dada(filtRs, err=errR, multithread=FALSE)
+dadaFs[[1]]
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+seqtab<-makeSequenceTable(mergers)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+#Too many reads were being removed by dada2s remove bimera denovo, decided to use a referenced based approach (Vsearch) to keep more data. Referenced base
+#chimera removal is fine for gut data, dbs are well maintianed and curated. 
+
+#removed dada set
+## seqtab.nochim<- removeBimeraDenovo(seqtab, method="consensus", multithread=16 , verbose=TRUE)
+
+#subbed in chimera removal 
+# used vsearch to remove chimeras using a referenced based approach. following code was run using the UCHIME gold referece db
+#vsearch --uchime_ref ASV.fasta --chimeras chimeraList.fa  --nonchimeras asvNoChim.fa --db gold.fa --threads 4 --uchimeout stats.txt
+# link to db - https://drive5.com/uchime/uchime_download.html
+#https://usermanual.wiki/Document/vsearchmanual.523130275/html manual used to run vsearch 
+
+#vsearch output
+# Found 1041 (9.8%) chimeras, 9524 (89.8%) non-chimeras,
+# and 38 (0.4%) borderline sequences in 10603 unique sequences.
+# Taking abundance information into account, this corresponds to
+# 1041 (9.8%) chimeras, 9524 (89.8%) non-chimeras,
+# and 38 (0.4%) borderline sequences in 10603 total sequences.
+
+#creating fasta file for vsearch 
+bodkeJustsequences <- colnames(seqtab.nochim)
+write.fasta(bodkeJustsequences, bodkeJustsequences, 'bodkeJustsequences.fasta', open = "w", nbchar = 60, as.string = FALSE)
+
+
+#Have to removed sequences identified as chimeric from seqtab, python script was used to do this. First seqtab had to be transposed to for easy pythoning 
+
+
+#Data was output by python was fed back into dada 2 
+seqtabTransposed <- t(seqtab)
+write.table(seqtabTransposed, file = "seqtabTransposed.txt", row.names=TRUE, col.names = TRUE,sep = "\t")
+
+#python script 
+### remove chimeras, look for lines that start with the chimera (read in from chim list) a
+### only write lines which do not have chimeras
+##
+###reading in chimeras
+##
+##from Bio import SeqIO
+##chimList =[]
+##fasta_sequences = SeqIO.parse(open('C:/Users/jjcol/Downloads/chimeraList.fa'),'fasta')
+##for fasta in fasta_sequences:
+##    chimList.append(str(fasta.seq))
+##
+###reading in table
+##seqtab= open("C:/Users/jjcol/Downloads/seqtabTransposed.txt", "r")
+##seqtab.nochim =[] 
+##counter = 0 
+##
+##for line in seqtab:
+##    counter +=1 
+##    isIn = False
+##    for chim in chimList:
+##        if line.startswith(chim)== True:
+##            isIn = True
+##    if isIn == False:
+##        seqtab.nochim.append(line)
+##output = open('C:/Users/jjcol/Downloads/seqtab.nochimTransposed.txt','w')
+##
+##for s in seqtab.nochim:
+##    output.write(s+ '\n')
+##output.close()
+
+
+seqtab.nochim<-read.table('seqtab.nochimTransposed.txt')
+seqtab.nochim <- t(seqtab.nochim)
+
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, rowSums(seqtab.nochim))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+taxaBodke <- assignTaxonomy(seqtab.nochim, "~/silva_nr99_v138.1_train_set.fa.gz", multithread=TRUE) ## Change to the correct database
+taxaBodke.print <- taxaBodke # Removing sequence rownames for display only
+rownames(taxaBodke.print) <- NULL
+head(taxaBodke.print)
+head(seqtab.nochim)
+dim(seqtab.nochim)
+
+# end bodke
+
+#begin Pune
+
+## Dataset was mostly normal, only adjustments made to filter and trim, 240, 60 rather than 240, 160. reverse read data quickly dropped off in quality. 
+#Coupled with differences in previous illumina data made it hard to process in one step. 
+
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+#Control set I 
+fnFs2 <- sort(list.files(path, pattern="rRNA_V4_sequences_from_human_stool_samples_1.fastq.gz", full.names = TRUE))
+fnRs2 <- sort(list.files(path, pattern="rRNA_V4_sequences_from_human_stool_samples_2.fastq.gz", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs2), "_"), `[`, 1)
+
+# Place filtered files in filtered/ subdirectory
+filtFs2 <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs2 <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs2) <- sample.names
+names(filtRs2) <- sample.names
+head(track)
+plotQualityProfile(fnFs2)
+plotQualityProfile(fnRs2)
+out <- filterAndTrim(fnFs2, filtFs2, fnRs2, filtRs2,truncLen=c(240,60),
+                     maxN=0, maxEE=c(2,2), truncQ=3, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+head(out)
+errF2 <- learnErrors(filtFs2, multithread=FALSE, randomize = TRUE)
+errR2 <- learnErrors(filtRs2, multithread=FALSE, randomize = TRUE)
+plotErrors(errF, nominalQ=TRUE)
+dadaFs2 <- dada(filtFs2, err=errF2, multithread=TRUE)
+dadaRs2 <- dada(filtRs2, err=errR2, multithread=TRUE)
+dadaFs2[[1]]
+mergers2 <- mergePairs(dadaFs2, filtFs2, dadaRs2, filtRs2, verbose=TRUE)
+head(mergers2[[1]])
+seqtab3 <- makeSequenceTable(mergers2)
+dim(seqtab3)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab3)))
+
+seqtab.nochim3<- removeBimeraDenovo(seqtab3, method="consensus", multithread=FALSE , verbose=TRUE)
+dim(seqtab.nochim3)
+sum(seqtab.nochim3)/sum(seqtab3)
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs2, getN), sapply(dadaRs2, getN), sapply(mergers2, getN), rowSums(seqtab.nochim3))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+## end Pune
+
+## begin Dubey - pan India sequencing data, pulled only non-obese data from Delhi region of india (needed to be Delhi, as diet varys greatly in India leading to 
+#large shifts in microbiome) this dataset utlised pyrosequencing, needed most different script as there is only one read. Nothing to merge. 
+## We should be able to add the DADAFs to mergers then make seqtab since each is simply a list. DADA2 script edited to work with homopolymers by removing all 
+#references to reverse reads. 
+fnFs3 <- sort(list.files(path, pattern="ERR", full.names = TRUE))
+
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs3), "_"), `[`, 1)
+plotQualityProfile(fnFs3[1:2])
+# Place filtered files in filtered/ subdirectory
+filtFs3 <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+names(filtFs3) <- sample.names
+
+#
+out <- filterAndTrim(fnFs3, filtFs3, 
+                     maxN=0, maxEE=c(2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE, trimLeft=100) # On Windows set multithread=FALSE
+head(out)
+plotQualityProfile(filtFs3[1:2])
+errF3 <- learnErrors(filtFs3, multithread=FALSE, randomize = TRUE)
+plotErrors(errF3, nominalQ=TRUE)
+#additional changes to dada2, added homopolymer_gap_penalty, and band_size in accordance with dada2 FAQs 
+dadaFs3 <- dada(filtFs3, err=errF3, multithread=TRUE,HOMOPOLYMER_GAP_PENALTY=-1, BAND_SIZE=32)
+dadaFs3[[1]]
+seqtab4 <- makeSequenceTable(dadaFs3)
+dim(seqtab4)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab3)))
+seqtab.nochim4 <- removeBimeraDenovo(seqtab4, method="consensus", multithread=FALSE , verbose=TRUE)
+dim(seqtab.nochim4)
+sum(seqtab.nochim4)/sum(seqtab4)
+
+## combining the three sequence tables and assigning taxonomy 
+mergetab <- mergeSequenceTables(seqtab.nochim,seqtab.nochim3,seqtab.nochim4)
+sequences<-getSequences(mergetab)
+names(sequences)<-sequences
+taxa <- assignTaxonomy(mergetab, "~/silva_nr99_v138.1_train_set.fa.gz", multithread=TRUE) ## Change to the correct database
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+#creating phylogenetic tree, dataset too large to make a tree in accordance with phangorn tutorial. This script was made using docs, builds a UPMA tree. Quick 
+#and easy, less accurate. However, more accurate trees were impossible to make with data, R continually crashed. Having a tree is better than no tree 
+alignment <- AlignSeqs(DNAStringSet(sequences), anchor=NA)
+phang.align <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phang.align)
+treeUPMABodke <- upgma(dm)
+plot(treeUPMABodke, main="UPGMA")
+write.tree(treeUPMABodke, file = "bodkeTreeNewControls.nwk", append = FALSE,
+           digits = 10, tree.names = FALSE)
+
+# adding taxonomic classifcation to asvs and writing taxa table to file 
+colnames(taxa) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus","Species")
+write.table(taxa, file = "taxaTableNewControls.txt", row.names=TRUE, col.names = TRUE,sep = "\t")
+
+#writing asv table to file 
+asvTable<-mergetab
+write.table(asvTable, file="ASVTableNewData.txt", row.names=TRUE , sep="\t")
+
+## creating fasta file of ASVs for picrust2 
+ASV_seqs <- colnames(mergetab)
+write.fasta(sequences = as.list(ASV_seqs), names = as.list(ASV_seqs), nbchar = 80, file.out = "ASV.fasta")
+
+### creating biom format table for picrust2 
+biomTable<-make_biom(t(mergetab), sample_metadata = NULL, observation_metadata = NULL,
+          id = NULL,matrix_element_type = "int")
+write_biom(biomTable, biom_file="table.biom")
